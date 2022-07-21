@@ -2,6 +2,13 @@
 Convert between ISO and ZSO formats used in OPL.\
 Very early code, probably filled with memory exploits, use with caution.
 
+# Todo
+* ~~Initial compression~~
+* ~~Initial decompression~~
+* Clean up code and fix cli
+* Multithreading
+* Mass-conversion
+
 # Credits
 Based on [ziso.py](https://github.com/ps2homebrew/Open-PS2-Loader/blob/master/pc/ziso.py) from the [Open-PS2-Loader](https://github.com/ps2homebrew/Open-PS2-Loader/) project. Original license attached below.
 ```

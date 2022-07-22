@@ -9,5 +9,5 @@ description = "ISO and ZSO converter. Based on ziso.py"
 
 [dependencies]
 lz4_flex = "0.9"
-clap = { version = "3.2", features = ["cargo"] }
+clap = { version = "3", features = ["cargo"] }
 byteorder = "1"

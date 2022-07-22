@@ -20,20 +20,20 @@ jobs:
       - name: Compile release
         run: cargo build --release
 
-      - name: Get Hash
-        id: hash
-        run: echo "git_hash=$(git rev-parse --short "$GITHUB_SHA")" >> $GITHUB_HASH
+      - name: Get commit hash
+        id: commit
+        uses: pr-mpt/actions-commit-hash@v1
 
       - name: Upload artifact
         if: ${{ matrix.os != 'windows-latest' }}
         uses: actions/upload-artifact@v3
         with:
-          name: ziso-rs-${{ env.hash }}-${{matrix.os}}
+          name: ziso-rs-${{ steps.commit.outputs.short }}-${{ runner.os }}
           path: target/release/ziso-rs
 
       - name: Upload artifact (Windows)
         if: ${{ matrix.os == 'windows-latest' }}
         uses: actions/upload-artifact@v3
         with:
-          name: ziso-rs-${{ env.hash }}-${{matrix.os}}
+          name: ziso-rs-${{ steps.commit.outputs.short }}-${{ runner.os }}
           path: target/release/ziso-rs.exe

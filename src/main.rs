@@ -1,13 +1,16 @@
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{prelude::*, SeekFrom, Cursor};
 use std::path::PathBuf;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use lz4_flex::block::{compress, decompress};
 
-use clap::{arg, command, value_parser};
+use clap::{arg, command, value_parser, ArgAction, ValueHint};
 
-const ZISO_MAGIC: u32 = 0x4F53495A;
+// ZSO format constants
+const ZSO_MAGIC: u32 = 0x4F53495A;
+const ZSO_HEADER_SIZE: u32 = 0x18;
+const ZSO_VER: i8 = 1;
 
 fn open_input_output(fname_in: &PathBuf, fname_out: &PathBuf) -> (File, File) {
     let fin = File::open(&fname_in);
@@ -23,8 +26,6 @@ fn open_input_output(fname_in: &PathBuf, fname_out: &PathBuf) -> (File, File) {
 
 fn read_zso_header(fin: &mut File) -> (u32, u32, u64, u32, i8, i8) {
     // ZSO header has 0x18 bytes
-    fin.seek(SeekFrom::Current(0)).unwrap();
-
     let magic = fin.read_u32::<LittleEndian>().unwrap();
     let header_size = fin.read_u32::<LittleEndian>().unwrap();
     let total_bytes = fin.read_u64::<LittleEndian>().unwrap();
@@ -34,55 +35,52 @@ fn read_zso_header(fin: &mut File) -> (u32, u32, u64, u32, i8, i8) {
 
     fin.seek(SeekFrom::Current(2)).unwrap();
 
-    return (magic, header_size, total_bytes, block_size, ver, align)
+    return (magic, header_size, total_bytes, block_size, ver, align);
 }
 
 fn generate_zso_header(
-    magic: u32,
-    header_size: u32,
     total_bytes: u64,
     block_size: u32,
-    ver: i8,
     align: i8,
-) -> [u8; 0x18] {
-    let mut data = Cursor::new([0; 0x18]);
-    data.write_u32::<LittleEndian>(magic).unwrap();
-    data.write_u32::<LittleEndian>(header_size).unwrap();
+) -> [u8; ZSO_HEADER_SIZE as usize] {
+    let mut data = Cursor::new([0; ZSO_HEADER_SIZE as usize]);
+    data.write_u32::<LittleEndian>(ZSO_MAGIC).unwrap();
+    data.write_u32::<LittleEndian>(ZSO_HEADER_SIZE).unwrap();
     data.write_u64::<LittleEndian>(total_bytes).unwrap();
     data.write_u32::<LittleEndian>(block_size).unwrap();
-    data.write_i8(ver).unwrap();
+    data.write_i8(ZSO_VER).unwrap();
     data.write_i8(align).unwrap();
     return *data.get_ref();
-}
-
-fn show_zso_info(fname_in: &PathBuf, fname_out: &PathBuf, total_bytes: &u64, block_size: &u32, total_block: &usize, align: &i8) {
-    println!("Decompress '{:?}' to '{:?}'", fname_in, fname_out);
-    println!("Total File Size {:?} bytes", total_bytes);
-    println!("block size      {:?}  bytes", block_size);
-    println!("total blocks    {:?}  blocks", total_block);
-    println!("index align     {:?}", align);
 }
 
 fn decompress_zso(fname_in: &PathBuf, fname_out: &PathBuf) {
     let (mut fin, mut fout) = open_input_output(&fname_in, &fname_out);
 
+    let total_zso_bytes = fin.seek(SeekFrom::End(0)).unwrap();
+    fin.seek(SeekFrom::Start(0)).unwrap();
+
     let reff = std::io::Read::by_ref(&mut fin);
     let (magic, header_size, total_bytes, block_size, ver, align) = read_zso_header(reff);
 
-    if magic != ZISO_MAGIC || block_size == 0 || total_bytes == 0 || header_size != 24 || ver > 1 {
+    if magic != ZSO_MAGIC || block_size == 0 || total_bytes == 0 || header_size != 24 || ver > 1 {
         panic!("ziso file format error");
     }
-    let total_block: usize = (total_bytes / (block_size as u64)) as usize;
+    let total_block = (total_bytes / block_size as u64) as usize;
     let mut index_buf = vec![];
 
-    for _ in 0..(total_block + 1) {
+    for _ in 0..=total_block {
         index_buf.push(fin.read_u32::<LittleEndian>().unwrap());
     }
 
-    show_zso_info(&fname_in, &fname_out, &total_bytes, &block_size, &total_block, &align);
+    // show_zso_info
+    eprintln!("Decompress '{:?}' to '{:?}'", fname_in, fname_out);
+    eprintln!("Total File Size {:?} bytes", total_bytes);
+    eprintln!("block size      {:?}  bytes", block_size);
+    eprintln!("total blocks    {:?}  blocks", total_block);
+    eprintln!("index align     {:?}", align);
 
     let mut block: usize = 0;
-    let percent_period = total_block/100;
+    let percent_period = total_block / 100;
     let mut percent_cnt = 0;
 
     while block < total_block {
@@ -97,17 +95,19 @@ fn decompress_zso(fname_in: &PathBuf, fname_out: &PathBuf) {
         index &= 0x7fffffff;
         let read_pos = index << (align);
 
-        let mut read_size: u32 = 0;
-        if plain != 0 {
-            read_size = block_size;
-        } else {
-            let index2 = index_buf[block+1] & 0x7fffffff;
-            // Have to read more bytes if align was set
-            read_size = (index2-index) << (align);
-            if block == total_block - 1 {
-                read_size = (total_bytes as u32) - read_pos;
+        let read_size = {
+            if plain != 0 {
+                block_size
+            } else {
+                let index2 = index_buf[block + 1] & 0x7fffffff;
+                // Have to read more bytes if align was set
+                if block == total_block - 1 {
+                    (total_zso_bytes as u32) - read_pos
+                } else {
+                    (index2 - index) << (align)
+                }
             }
-        }
+        };
 
         fin.seek(SeekFrom::Start(read_pos as u64)).unwrap();
 
@@ -117,19 +117,21 @@ fn decompress_zso(fname_in: &PathBuf, fname_out: &PathBuf) {
             .read_to_end(&mut zso_data)
             .unwrap();
 
-        let mut dec_data: Vec<u8> = vec![];
-        if plain != 0 {
-            dec_data = zso_data
-        } else {
-            let dec = decompress(&zso_data, block_size as usize);
-
-            if Result::is_err(&dec) {
-                let e = "temp";
-                panic!("{:?} block: 0x{:x} {:?} {:?}", block, read_pos, read_size, e);
+        let dec_data = {
+            if plain != 0 {
+                zso_data
+            } else {
+                let dec = decompress(&zso_data, block_size as usize);
+                if Result::is_err(&dec) {
+                    let e = "temp";
+                    panic!(
+                        "{:?} block: 0x{:x} {:?} {:?}",
+                        block, read_pos, read_size, e
+                    );
+                }
+                dec.unwrap()
             }
-
-            dec_data = dec.unwrap();
-        }
+        };
 
         if dec_data.len() != block_size as usize {
             panic!("{:?} block: 0x{:x} {:?}", block, read_pos, read_size);
@@ -138,25 +140,9 @@ fn decompress_zso(fname_in: &PathBuf, fname_out: &PathBuf) {
         block += 1;
     }
 
-    drop(fin);
+    eprintln!("syncing data");
     fout.sync_all().unwrap();
-    drop(fout);
-    println!("ziso decompress completed");
-}
-
-fn show_comp_info(
-    fname_in: &PathBuf,
-    fname_out: &PathBuf,
-    total_bytes: u64,
-    block_size: u32,
-    align: i8,
-    level: u8,
-) {
-    println!("Compress '{:?}' to '{:?}'", fname_in, fname_out);
-    println!("Total File Size {:?} bytes", total_bytes);
-    println!("block size      {:?}  bytes", block_size);
-    println!("index align     {:?}", 1 << align);
-    println!("compress level  {:?}", level);
+    eprintln!("ziso decompress completed");
 }
 
 fn set_align(fout: &mut File, write_pos: u64, align: i8, padding: char) -> u64 {
@@ -174,52 +160,48 @@ fn set_align(fout: &mut File, write_pos: u64, align: i8, padding: char) -> u64 {
 fn compress_zso(
     fname_in: &PathBuf,
     fname_out: &PathBuf,
-    level: &u8,
     percent: &u8,
-    align: &i8,
+    align_arg: &i8,
     pad: &char,
 ) {
     let (mut fin, mut fout) = open_input_output(&fname_in, &fname_out);
     let total_bytes = fin.seek(SeekFrom::End(0)).unwrap();
     fin.seek(SeekFrom::Start(0)).unwrap();
 
-    let magic = ZISO_MAGIC;
-    let header_size = 0x18;
     let block_size = 0x800;
-    let ver = 1;
-    let mut alignment = *align;
 
     // We have to use alignment on any ZSO files which > 2GB, for MSB bit of index as the plain indicator
     // If we don't then the index can be larger than 2GB, which its plain indicator was improperly set
-    alignment = (total_bytes / u64::pow(2, 31)) as i8;
+    let align = {
+        if total_bytes >= u64::pow(2, 31) && align_arg == &0 {
+            1
+        } else {
+            *align_arg
+        }
+    };
 
-    let header = generate_zso_header(magic, header_size, total_bytes, block_size, ver, alignment);
-    fout.seek(SeekFrom::Start(0)).unwrap();
+    let header = generate_zso_header(total_bytes, block_size, align);
     fout.write(&header).unwrap();
 
-    let total_block = (total_bytes as u32) / block_size;
-    let mut index_buf: Vec<u64> = vec![];
+    let total_block = (total_bytes / block_size as u64) as usize;
+    let mut index_buf: Vec<u32> = vec![];
     index_buf.resize((total_block + 1) as usize, 0);
 
-    fout.seek(SeekFrom::Start(0x18)).unwrap();
     for _ in 0..index_buf.len() {
         fout.write(b"\x00\x00\x00\x00").unwrap();
     }
 
-    show_comp_info(
-        &fname_in,
-        &fname_out,
-        total_bytes,
-        block_size,
-        alignment,
-        *level,
-    );
+    // show_comp_info
+    eprintln!("Compress '{:?}' to '{:?}'", fname_in, fname_out);
+    eprintln!("Total File Size {:?} bytes", total_bytes);
+    eprintln!("block size      {:?}  bytes", block_size);
+    eprintln!("index align     {:?}", 1 << align);
 
     let mut write_pos = fout.seek(SeekFrom::Current(0)).unwrap();
     let percent_period = total_block / 100;
     let mut percent_cnt = 0;
 
-    let mut block = 0;
+    let mut block: usize = 0;
     while block < total_block {
         percent_cnt += 1;
 
@@ -249,13 +231,13 @@ fn compress_zso(
 
         let mut zso_data = compress(&iso_data);
 
-        write_pos = set_align(&mut fout, write_pos, alignment, *pad);
-        index_buf[block as usize] = (write_pos >> alignment) as u64;
+        write_pos = set_align(&mut fout, write_pos, align, *pad);
+        index_buf[block] = write_pos as u32 >> align;
 
         if 100 * zso_data.len() / iso_data.len() >= (*percent as usize) {
             zso_data = iso_data;
-            index_buf[block as usize] |= 0x80000000 // Mark as plain
-        } else if (index_buf[block as usize] & 0x80000000) > 1 {
+            index_buf[block] |= 0x80000000 // Mark as plain
+        } else if (index_buf[block] & 0x80000000) > 1 {
             panic!("Align error, you have to increase align by 1 or CFW won't be able to read offset above 2 ** 31 bytes");
         }
 
@@ -265,73 +247,85 @@ fn compress_zso(
     }
 
     // Last position (total size)
-    index_buf[block as usize] = (write_pos >> alignment) as u64;
+    index_buf[block] = write_pos as u32 >> align;
 
     // Update index block
-    fout.seek(SeekFrom::Start(header.len() as u64)).unwrap();
+    fout.seek(SeekFrom::Start(ZSO_HEADER_SIZE as u64)).unwrap();
     for i in index_buf {
-        fout.write_u32::<LittleEndian>(i as u32).unwrap();
+        fout.write_u32::<LittleEndian>(i).unwrap();
     }
 
-    println!(
-        "ziso compress completed , total size = {:?} bytes , rate {:?}",
+    eprintln!("\nsyncing data");
+    fout.sync_all().unwrap();
+
+    eprintln!(
+        "ziso compress completed , total size = {:?} bytes , rate {:?}%",
         write_pos,
         write_pos * 100 / total_bytes
     );
-
-    drop(fin);
-    fout.sync_all().unwrap();
-    drop(fout);
 }
 
 fn main() {
     let args = command!()
+        // Files I/O
         .arg(
             arg!(<input> "Input file to process")
-            .value_parser(value_parser!(PathBuf))
+                .value_parser(value_parser!(PathBuf))
+                .value_hint(ValueHint::FilePath)
         )
         .arg(
             arg!(<output> "Final output file")
-            .value_parser(value_parser!(PathBuf))
+                .value_parser(value_parser!(PathBuf))
+                .value_hint(ValueHint::FilePath)
         )
+        // Compression
         .arg(
-            arg!(-c --compress <level> "1-9 compress ISO to ZSO, use any non-zero number it has no effect. 0 decompress ZSO to ISO")
-            .value_parser(value_parser!(u8))
+            arg!(-c --compress "Compress ISO to ZSO")
+                .action(ArgAction::SetTrue)
+                .required_unless_present("decompress")
+                .conflicts_with("decompress")
         )
         .arg(
             arg!(-t --threshold <percent> "Compression Threshold (1-100)")
-            .required(false)
-            .value_parser(value_parser!(u8))
-            .default_value("100")
+                .value_parser(value_parser!(u8).range(1..101))
+                .default_value("100")
+                .required(false)
         )
         .arg(
             arg!(-a --align <align> "Padding alignment 0=small/slow 6=fast/large")
-            .required(false)
-            .value_parser(value_parser!(i8))
-            .default_value("0")
+                .value_parser(value_parser!(i8).range(0..6))
+                .default_value("0")
+                .required(false)
         )
         .arg(
             arg!(-p --padding <pad> "Padding byte")
-            .required(false)
-            .value_parser(value_parser!(char))
-            .default_value("X")
+                .value_parser(value_parser!(char))
+                .default_value("X")
+                .required(false)
+        )
+        // Decompression
+        .arg(
+            arg!(-d --decompress "Decompress ZSO to ISO")
+                .action(ArgAction::SetTrue)
+                .required_unless_present("compress")
+                .conflicts_with("compress")
         )
         .get_matches();
 
-    let compress = args.get_one::<u8>("compress").unwrap();
-    if compress == &0u8 {
+    if *args.get_one::<bool>("compress").unwrap() {
+        compress_zso(
+            args.get_one::<PathBuf>("input").unwrap(),
+            args.get_one::<PathBuf>("output").unwrap(),
+            args.get_one::<u8>("threshold").unwrap(),
+            args.get_one::<i8>("align").unwrap(),
+            args.get_one::<char>("padding").unwrap(),
+        );
+    } else if *args.get_one::<bool>("decompress").unwrap() {
         decompress_zso(
             args.get_one::<PathBuf>("input").unwrap(),
             args.get_one::<PathBuf>("output").unwrap(),
         );
     } else {
-        compress_zso(
-            args.get_one::<PathBuf>("input").unwrap(),
-            args.get_one::<PathBuf>("output").unwrap(),
-            args.get_one::<u8>("compress").unwrap(),
-            args.get_one::<u8>("threshold").unwrap(),
-            args.get_one::<i8>("align").unwrap(),
-            args.get_one::<char>("padding").unwrap(),
-        );
+        panic!("no");
     }
 }

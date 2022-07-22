@@ -1,0 +1,39 @@
+name: Compile release builds
+on: [push]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install rust
+        uses: hecrj/setup-rust-action@v1
+        with:
+          rust-version: stable
+
+      - name: Compile release
+        run: cargo build --release
+
+      - name: Get Hash
+        id: hash
+        run: echo "git_hash=$(git rev-parse --short "$GITHUB_SHA")" >> $GITHUB_HASH
+
+      - name: Upload artifact
+        if: ${{ matrix.os != 'windows-latest' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: ziso-rs-${{ env.hash }}-${{matrix.os}}
+          path: target/release/ziso-rs
+
+      - name: Upload artifact (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: ziso-rs-${{ env.hash }}-${{matrix.os}}
+          path: target/release/ziso-rs.exe
